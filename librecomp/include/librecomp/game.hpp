@@ -123,6 +123,7 @@ namespace recomp {
     bool flashram_allowed();
 
     void start_game(const std::u8string& game_id, const std::string& game_mode_id);
+    void stop_game();
     std::u8string current_game_id();
     std::string current_mod_game_id();
 }

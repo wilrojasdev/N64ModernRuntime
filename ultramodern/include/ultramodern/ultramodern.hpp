@@ -123,6 +123,8 @@ struct gfx_callbacks_t {
 
 bool is_game_started();
 void quit();
+void request_game_stop();
+bool is_game_stop_requested();
 void join_event_threads();
 void join_thread_cleaner_thread();
 void join_saving_thread();

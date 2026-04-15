@@ -41,7 +41,8 @@
 enum GameStatus {
     None,
     Running,
-    Quit
+    Quit,
+    Stopped  // Game ended, return to launcher (re-enter wait loop)
 };
 
 // Mutexes
@@ -549,12 +550,31 @@ bool ultramodern::is_game_started() {
 }
 
 std::atomic_bool exited = false;
+static std::atomic_bool game_stop_requested = false;
+
+void ultramodern::request_game_stop() {
+    game_stop_requested.store(true);
+}
+
+bool ultramodern::is_game_stop_requested() {
+    return game_stop_requested.load();
+}
 moodycamel::LightweightSemaphore graphics_shutdown_ready;
 
 void ultramodern::quit() {
     exited.store(true);
     GameStatus desired = GameStatus::None;
     game_status.compare_exchange_strong(desired, GameStatus::Quit);
+    game_status.notify_all();
+    std::lock_guard<std::mutex> lock(current_game_mutex);
+    current_game.reset();
+}
+
+void recomp::stop_game() {
+    // Note: Currently not effective at stopping the N64 game threads.
+    // The relaunch approach is used instead. Kept for future use.
+    game_stop_requested.store(true);
+    game_status.store(GameStatus::None);
     game_status.notify_all();
     std::lock_guard<std::mutex> lock(current_game_mutex);
     current_game.reset();
@@ -699,7 +719,12 @@ void recomp::mods::set_mod_index(const std::string &mod_game_id, const std::stri
 }
 
 bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
-    game_status.wait(GameStatus::None);
+    // Wait until game_status changes from None. If it's already Running (start_game was
+    // called before we got here), skip the wait.
+    while (game_status.load() == GameStatus::None) {
+        game_status.wait(GameStatus::None);
+    }
+    game_stop_requested.store(false);
 
     switch (game_status.load()) {
         // TODO refactor this to allow a project to specify what entrypoint function to run for a give game.
@@ -740,7 +765,7 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                             if (!cur_error.error_param.empty()) {
                                 mod_error_stream << " (" << cur_error.error_param.c_str() << ")";
                             }
-                            mod_error_stream << "\n";                                
+                            mod_error_stream << "\n";
                         }
                         ultramodern::error_handling::message_box(mod_error_stream.str().c_str());
                         game_status.store(GameStatus::None);
@@ -758,11 +783,26 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                 } catch (ultramodern::thread_terminated& terminated) {
 
                 }
+
+                // If game was stopped via stop_game(), clear RDRAM and return false to re-enter the wait loop
+                if (game_stop_requested.load()) {
+                    printf("[Recomp] Game stopped — clearing RDRAM and returning to wait loop\n");
+                    std::memset(rdram, 0, 8 * 1024 * 1024);
+                    game_stop_requested.store(false);
+                    // Ensure status is None so we can wait for next start_game()
+                    game_status.store(GameStatus::None);
+                    return false;
+                }
             }
             return true;
 
         case GameStatus::Quit:
             return true;
+
+        case GameStatus::Stopped:
+            // Stopped before game even ran — reset and re-wait
+            game_status.store(GameStatus::None);
+            return false;
 
         case GameStatus::None:
             return true;
@@ -881,7 +921,8 @@ void recomp::start(
 
         recomp_context context{};
 
-        // Loop until the game starts.
+        // Loop: wait for game start, run, repeat on stop (return to launcher).
+        // Returns false on stop → re-enters wait. Returns true on quit → exits.
         while (!wait_for_game_started(rdram, &context)) {}
     }, window_handle, rdram};
 

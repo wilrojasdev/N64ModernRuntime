@@ -147,7 +147,16 @@ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
 #endif
 
 void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
-    thread_context->running.wait();
+    // Use timed wait so we can periodically check for game stop requests
+    while (!thread_context->running.wait(10000)) { // 10ms timeout
+        if (ultramodern::is_game_stop_requested()) {
+            throw ultramodern::thread_terminated{};
+        }
+    }
+    // Check stop flag after being signaled too
+    if (ultramodern::is_game_stop_requested()) {
+        throw ultramodern::thread_terminated{};
+    }
     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
     // This will trigger thread cleanup instead.
     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
@@ -162,6 +171,9 @@ void resume_thread(OSThread* t) {
 
 void run_next_thread(RDRAM_ARG1) {
     if (ultramodern::thread_queue_empty(PASS_RDRAM ultramodern::running_queue)) {
+        if (ultramodern::is_game_stop_requested()) {
+            throw ultramodern::thread_terminated{};
+        }
         throw std::runtime_error("No threads left to run!\n");
     }
 
@@ -220,7 +232,11 @@ static void _thread_func(RDRAM_ARG PTR(OSThread) self_, PTR(thread_func_t) entry
     // so mark this thread as destroyed and run the next queued thread.
     if (self->context == thread_context) {
         self->context = nullptr;
-        run_next_thread(PASS_RDRAM1);
+        try {
+            run_next_thread(PASS_RDRAM1);
+        } catch (ultramodern::thread_terminated&) {
+            // Game stop requested — no more threads to run, exit cleanly
+        }
     }
 
     // Dispose of this thread now that it's completed or terminated.

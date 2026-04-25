@@ -98,9 +98,20 @@ void recomp::mods::initialize_mods() {
     mod_context->set_mod_config_directory(config_path / mod_config_directory);
 }
 
-void recomp::mods::register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes) {
+void recomp::mods::register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes,
+                                          const std::string& container_ext) {
     std::lock_guard<std::mutex> lock(mod_context_mutex);
-    mod_context->register_embedded_mod(mod_id, mod_bytes);
+    mod_context->register_embedded_mod(mod_id, mod_bytes, container_ext);
+}
+
+void recomp::mods::set_force_enabled_overrides(std::unordered_map<std::string, bool> overrides) {
+    std::lock_guard<std::mutex> lock(mod_context_mutex);
+    mod_context->set_force_enabled_overrides(std::move(overrides));
+}
+
+bool recomp::mods::is_embedded_mod(const std::string& mod_id) {
+    std::lock_guard<std::mutex> lock(mod_context_mutex);
+    return mod_context->is_embedded_mod(mod_id);
 }
 
 void recomp::mods::register_deprecated_mod(const std::string& mod_id, recomp::mods::DeprecationStatus deprecation_status, const Version& maximum_version) {

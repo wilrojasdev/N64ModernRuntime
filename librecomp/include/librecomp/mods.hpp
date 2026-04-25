@@ -339,8 +339,17 @@ namespace recomp {
             ~ModContext();
 
             void register_game(const std::string& mod_game_id);
-            void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
+            // container_ext is ".nrm" for code mods, ".rtz" for texture packs, etc.
+            // Must match an extension previously passed to register_mod_container_type.
+            void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes,
+                                       const std::string& container_ext = ".nrm");
             void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version& maximum_version);
+            // Override the enabled/disabled state of specific mod IDs. Applied inside
+            // load_mods_config() after parsing mods.json. Driven by the launcher locale
+            // so the bundled language pack always matches the selected language.
+            void set_force_enabled_overrides(std::unordered_map<std::string, bool> overrides);
+            // True if mod_id was added via register_embedded_mod (i.e. baked into the binary).
+            bool is_embedded_mod(const std::string& mod_id) const;
             std::vector<ModOpenErrorDetails> scan_mod_folder(const std::filesystem::path& mod_folder);
             void close_mods();
             void load_mods_config();
@@ -406,7 +415,19 @@ namespace recomp {
             std::unordered_map<std::string, ModContainerType> container_types;
             // Maps game mod ID to the mod's internal integer ID. 
             std::unordered_map<std::string, size_t> mod_game_ids;
-            std::unordered_map<std::string, std::span<const uint8_t>> embedded_mod_bytes;
+            // Per-embedded-mod metadata: raw bytes + container extension (".nrm"/".rtz")
+            // so scan_mod_folder can look up the right ModContainerType (content types,
+            // requires_manifest) when loading. Without the extension we'd treat every
+            // embedded mod as a generic .nrm, which silently breaks .rtz texture packs
+            // because their content type is gated behind the rtz container registration.
+            struct EmbeddedModEntry {
+                std::span<const uint8_t> bytes;
+                std::string container_ext;
+            };
+            std::unordered_map<std::string, EmbeddedModEntry> embedded_mod_bytes;
+            // mod_id -> desired enabled/disabled state. Overrides mods.json + enabled_by_default
+            // when set. Used by the bundled language-pack mechanism.
+            std::unordered_map<std::string, bool> force_enable_overrides;
             std::vector<ModHandle> opened_mods;
             std::unordered_map<std::string, size_t> opened_mods_by_id;
             std::unordered_map<std::filesystem::path::string_type, size_t> opened_mods_by_filename;
@@ -621,8 +642,19 @@ namespace recomp {
         CodeModLoadError validate_api_version(uint32_t api_version, std::string& error_param);
 
         void initialize_mods();
-        void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes);
+        // container_ext defaults to ".nrm". Use ".rtz" (or any other registered ext)
+        // to bundle texture packs / non-code content alongside code mods.
+        void register_embedded_mod(const std::string& mod_id, std::span<const uint8_t> mod_bytes,
+                                   const std::string& container_ext = ".nrm");
         void register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version);
+        // Force-enable / force-disable specific mods, overriding both `mods.json` and
+        // `enabled_by_default`. Useful for shipping bundled language packs whose state
+        // is driven by the launcher locale rather than the user's mod config. Must be
+        // called before scan_mods() (effectively before recomp::start() in main).
+        void set_force_enabled_overrides(std::unordered_map<std::string, bool> overrides);
+        // True if `mod_id` was registered via register_embedded_mod() (i.e. shipped
+        // inside the binary). Intended for UI filtering so bundled mods stay hidden.
+        bool is_embedded_mod(const std::string& mod_id);
         void scan_mods();
         void close_mods();
         std::filesystem::path get_mods_directory();

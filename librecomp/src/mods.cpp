@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <functional>
+#include <algorithm>
 
 #include "librecomp/files.hpp"
 #include "librecomp/mods.hpp"
@@ -613,7 +614,13 @@ recomp::mods::ModLoadError recomp::mods::ModContext::load_mod(recomp::mods::ModH
     mod.section_load_addresses.clear();
 
     // Check that the mod's minimum recomp version is met.
-    if (get_project_version() < mod.manifest.minimum_recomp_version) {
+    // Embedded (binary-bundled) mods skip this gate: we control the bundle so the
+    // launcher version is irrelevant — the mod author wrote a min-version assuming
+    // upstream Recomp's versioning, but this fork uses its own scheme (e.g. 0.16.0)
+    // for the user-facing build number. Refusing to load our own bundled translations
+    // because of a version-string mismatch makes no sense.
+    if (!is_embedded_mod(mod.manifest.mod_id)
+        && get_project_version() < mod.manifest.minimum_recomp_version) {
         error_param = mod.manifest.minimum_recomp_version.to_string();
         return ModLoadError::MinimumRecompVersionNotMet;
     }
@@ -632,8 +639,17 @@ void recomp::mods::ModContext::register_game(const std::string& mod_game_id) {
     mod_game_ids.emplace(mod_game_id, mod_game_ids.size());
 }
 
-void recomp::mods::ModContext::register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes) {
-    embedded_mod_bytes.emplace(mod_id, mod_bytes);
+void recomp::mods::ModContext::register_embedded_mod(const std::string &mod_id, std::span<const uint8_t> mod_bytes,
+                                                     const std::string& container_ext) {
+    embedded_mod_bytes.emplace(mod_id, EmbeddedModEntry{ mod_bytes, container_ext });
+}
+
+void recomp::mods::ModContext::set_force_enabled_overrides(std::unordered_map<std::string, bool> overrides) {
+    force_enable_overrides = std::move(overrides);
+}
+
+bool recomp::mods::ModContext::is_embedded_mod(const std::string& mod_id) const {
+    return embedded_mod_bytes.contains(mod_id);
 }
 
 void recomp::mods::ModContext::register_deprecated_mod(const std::string& mod_id, DeprecationStatus deprecation_status, const Version &maximum_version) {
@@ -800,6 +816,50 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
     close_mods();
 
     static const std::vector<ModContentTypeId> empty_content_types{};
+
+    // Open embedded mods FIRST so a binary-bundled mod always wins over a copy
+    // the user might have manually placed in their mods folder. Folder duplicates
+    // will hit the DuplicateMod check inside open_mod_from_path; we filter those
+    // out below for embedded ids so the user doesn't see a noisy warning for a
+    // case we explicitly handled.
+    //
+    // Iterate in sorted order so load-order is deterministic. With our naming
+    // convention (bk_recomp_asset_expansion_pak, font_plus_latin_1, language packs)
+    // alphabetical sort puts shared dependencies before the language packs that
+    // need them — without this, unordered_map iteration is implementation-defined
+    // and language mods can load before their runtime deps, producing missing
+    // glyphs / empty text boxes.
+    {
+        std::vector<std::string> sorted_ids;
+        sorted_ids.reserve(embedded_mod_bytes.size());
+        for (const auto& kv : embedded_mod_bytes) sorted_ids.push_back(kv.first);
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+
+        for (const auto& mod_id : sorted_ids) {
+            if (opened_mods_by_id.contains(mod_id)) continue;
+
+            const auto& entry = embedded_mod_bytes.at(mod_id);
+            // Resolve content types from the container extension. Without this,
+            // .rtz texture packs would be opened as if they were code mods and
+            // their texture content type would be rejected by the manifest checks.
+            auto cont_it = container_types.find(entry.container_ext);
+            std::reference_wrapper<const std::vector<ModContentTypeId>> content_types =
+                std::cref(empty_content_types);
+            bool requires_manifest = true;
+            if (cont_it != container_types.end()) {
+                content_types = std::cref(cont_it->second.supported_content_types);
+                requires_manifest = cont_it->second.requires_manifest;
+            }
+
+            std::string open_error_param;
+            ModOpenError open_error = open_mod_from_memory(
+                entry.bytes, open_error_param, content_types, requires_manifest);
+            if (open_error != ModOpenError::Good) {
+                ret.emplace_back(mod_id, open_error, open_error_param);
+            }
+        }
+    }
+
     for (const auto& mod_path : std::filesystem::directory_iterator{mod_folder, std::filesystem::directory_options::skip_permission_denied, ec}) {
         bool is_mod = false;
         bool requires_manifest = true;
@@ -821,23 +881,17 @@ std::vector<recomp::mods::ModOpenErrorDetails> recomp::mods::ModContext::scan_mo
             ModOpenError open_error = open_mod_from_path(mod_path, open_error_param, supported_content_types, requires_manifest);
 
             if (open_error != ModOpenError::Good) {
+                // Silently swallow DuplicateMod when the duplicate id is embedded —
+                // the bundled copy wins and the user's manual install is intentionally shadowed.
+                if (open_error == ModOpenError::DuplicateMod && embedded_mod_bytes.contains(open_error_param)) {
+                    printf("  (shadowed by bundled mod '%s')\n", open_error_param.c_str());
+                    continue;
+                }
                 ret.emplace_back(mod_path.path(), open_error, open_error_param);
             }
         }
         else {
             printf("Skipping non-mod " PATHFMT PATHFMT "\n", mod_path.path().stem().c_str(), mod_path.path().extension().c_str());
-        }
-    }
-
-    for (const auto &mod_bytes : embedded_mod_bytes) {
-        if (opened_mods_by_id.contains(mod_bytes.first)) {
-            continue;
-        }
-
-        std::string open_error_param;
-        ModOpenError open_error = open_mod_from_memory(mod_bytes.second, open_error_param, empty_content_types, true);
-        if (open_error != ModOpenError::Good) {
-            ret.emplace_back(mod_bytes.first, open_error, open_error_param);
         }
     }
 
@@ -872,12 +926,21 @@ void recomp::mods::ModContext::load_mods_config() {
     rebuild_mod_order_lookup();
 
     // Enable mods that are specified in the configuration or mods that are considered new.
+    // Force-enable overrides (set by the launcher's locale-driven bundled language pack)
+    // take precedence over both the user's mods.json and the manifest's enabled_by_default.
     for (size_t i = 0; i < opened_mods.size(); i++) {
         const ModHandle& mod = opened_mods[i];
         const std::string &mod_id = mod.manifest.mod_id;
         bool is_default_enabled = !opened_mod_is_known[i] && mod.manifest.enabled_by_default;
         bool is_manually_enabled = config_enabled_mods.contains(mod_id);
-        if (is_default_enabled || is_manually_enabled) {
+        bool should_enable = is_default_enabled || is_manually_enabled;
+
+        auto override_it = force_enable_overrides.find(mod_id);
+        if (override_it != force_enable_overrides.end()) {
+            should_enable = override_it->second;
+        }
+
+        if (should_enable) {
             enable_mod(mod_id, true, false);
         }
     }
@@ -2612,6 +2675,23 @@ recomp::mods::CodeModLoadError recomp::mods::ModContext::resolve_code_dependenci
         if ((replacement.flags & N64Recomp::ReplacementFlags::Force) == N64Recomp::ReplacementFlags(0)) {
             auto find_it = base_patched_funcs.find(to_replace);
             if (find_it != base_patched_funcs.end()) {
+                // For embedded (binary-bundled) mods, downgrade this from a hard load
+                // failure to a per-replacement skip + warning. The bundle ships only
+                // translation packs whose replacements are mostly text/string shaders;
+                // hitting a base-recomp patch here means the bundle is colliding with
+                // a fork-specific patch (e.g. the online auto-load on
+                // gameSelect_initAndUpdate). The base patch wins — the rest of the
+                // translation still loads, the user just sees English on that one
+                // function's strings instead of the whole mod refusing to load.
+                if (is_embedded_mod(mod.manifest.mod_id)) {
+                    printf("[mods] Skipping replacement in '%s' for base-patched func "
+                           "(section=0x%x vram=0x%08x); base patch kept.\n",
+                           mod.manifest.mod_id.c_str(),
+                           replacement.original_section_vrom,
+                           replacement.original_vram);
+                    continue;
+                }
+
                 std::stringstream error_param_stream{};
                 error_param_stream << std::hex <<
                     "section: 0x" << replacement.original_section_vrom <<

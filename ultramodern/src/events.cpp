@@ -186,6 +186,17 @@ void vi_thread_func() {
     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Critical);
     using namespace std::chrono_literals;
 
+    // Seed both VI states with the dummy mode + framebuffer so update_vi()
+    // never deref's a nullptr mode if start_game() flips is_game_started
+    // before the first set_dummy_vi() iteration would have run. Without this,
+    // a fast start_game() (Android calls it from the gfx update callback)
+    // can deadlock the VI thread when both states happen to still be
+    // zero-initialized at the moment is_game_started() flips true.
+    set_dummy_vi(false);
+    events_context.vi.update_vi();   // copies states[1] (next) into states[0] (post-swap next)
+    set_dummy_vi(true);              // re-seed the post-swap next, harmless on top of dummy
+    events_context.vi.update_vi();   // both states now hold dummy mode + framebuffer
+
     int remaining_retraces = 1;
 
     while (!exited) {

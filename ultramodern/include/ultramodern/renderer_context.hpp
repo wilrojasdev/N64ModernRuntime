@@ -53,8 +53,11 @@ namespace ultramodern {
             DWORD thread_id = (DWORD)-1;
             auto operator<=>(const WindowHandle&) const = default;
         };
-// TODO add a native window handle option here (Display/Window for x11 and ANativeWindow for Android) as a compile-time option.
-#elif defined(__linux__) || defined(__ANDROID__)
+// TODO add a native window handle option here (Display/Window for x11) as a compile-time option.
+#elif defined(__ANDROID__)
+        // NativeActivity owns the surface; rt64/Plume consume ANativeWindow* directly.
+        using WindowHandle = ANativeWindow*;
+#elif defined(__linux__)
         using WindowHandle = SDL_Window*;
 #elif defined(__APPLE__)
         struct WindowHandle {
